@@ -229,12 +229,50 @@ func (conn *Conn) checkResend(now time.Time) {
 	_ = conn.resend(resend)
 }
 
-// Write writes a buffer b over the RakNet connection. The amount of bytes
-// written n is always equal to the length of the bytes written if writing was
-// successful. If not, an error is returned and n is 0. Write may be called
-// simultaneously from multiple goroutines, but will write one by one.
+// Write writes a buffer b over the RakNet connection. The packet is sent
+// reliably and in order: It is retransmitted until acknowledged, delivered at
+// most once and handled in the same order it was written in. The amount of
+// bytes written n is always equal to the length of the bytes written if
+// writing was successful. If not, an error is returned and n is 0. Write may
+// be called simultaneously from multiple goroutines, but will write one by
+// one. Packets longer than the connection MTU are split into fragments
+// automatically.
 func (conn *Conn) Write(b []byte) (n int, err error) {
 	return conn.writeWithReliability(b, reliabilityReliableOrdered)
+}
+
+// WriteReliable writes a buffer b over the RakNet connection reliably, but
+// without ordering. The packet is retransmitted until acknowledged and
+// delivered at most once, but packets are handled as soon as they arrive, even
+// if that means they are handled in a different order than they were written
+// in. Unlike Write, delivery is never held back by missing ordered packets. It
+// is useful for messages that must not be lost, but of which the order does
+// not matter.
+//
+// WriteReliable uses the message index of the reliable layer, which is
+// independent of the order index used by Write, so it does not consume a slot
+// in the ordered packet stream. The amount of bytes written n is always equal
+// to the length of b if writing was successful. If not, an error is returned
+// and n is 0. WriteReliable may be called simultaneously from multiple
+// goroutines, but will write one by one. Packets longer than the connection
+// MTU are split into fragments automatically.
+func (conn *Conn) WriteReliable(b []byte) (n int, err error) {
+	return conn.writeWithReliability(b, reliabilityReliable)
+}
+
+// WriteUnreliable writes a buffer b over the RakNet connection without
+// reliability: The packet may arrive out of order, be duplicated or not
+// arrive at all, and it is never retransmitted nor held back by the ordered
+// packet stream. It is useful for high-frequency messages that lose their
+// value quickly, such as position updates.
+//
+// The amount of bytes written n is always equal to the length of b if writing
+// was successful. If not, an error is returned and n is 0. WriteUnreliable
+// may be called simultaneously from multiple goroutines, but will write one
+// by one. Packets longer than the connection MTU are split into fragments
+// automatically.
+func (conn *Conn) WriteUnreliable(b []byte) (n int, err error) {
+	return conn.writeWithReliability(b, reliabilityUnreliable)
 }
 
 // writeWithReliability writes a buffer b over the RakNet connection using the
@@ -244,15 +282,16 @@ func (conn *Conn) Write(b []byte) (n int, err error) {
 // multiple goroutines, but will write one by one. Unlike Write, it allows
 // specifying the reliability.
 func (conn *Conn) writeWithReliability(b []byte, rel reliability) (n int, err error) {
-	select {
-	case <-conn.ctx.Done():
+	// Serialise all writes (including the shared send buffer) and check the
+	// closed state while holding the lock, so every reliability entry returns
+	// a net.ErrClosed error once the connection has been closed.
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if conn.ctx.Err() != nil {
 		return 0, conn.error(net.ErrClosed, "write")
-	default:
-		conn.mu.Lock()
-		defer conn.mu.Unlock()
-		n, err = conn.write(b, rel)
-		return n, conn.error(err, "write")
 	}
+	n, err = conn.write(b, rel)
+	return n, conn.error(err, "write")
 }
 
 // write writes a buffer b over the RakNet connection. The amount of bytes
@@ -481,9 +520,12 @@ func (conn *Conn) handleDatagram(b []byte) error {
 	return nil
 }
 
-// receivePacket handles the receiving of a packet. It puts the packet in the
-// queue and takes out all packets that were obtainable after that, and handles
-// them.
+// receivePacket handles the receiving of a packet. Reliable ordered packets
+// are put in the ordered packet queue and handled in order. Every other
+// reliability, including reliable unordered and unreliable packets, is handled
+// immediately based on the reliability in the packet header, independently of
+// the state of the ordered packet queue: A gap in the ordered packet stream
+// must not hold unordered packets back.
 func (conn *Conn) receivePacket(packet *packet) error {
 	if packet.reliability != reliabilityReliableOrdered {
 		// If it isn't a reliable ordered packet, handle it immediately.
@@ -661,7 +703,9 @@ func (conn *Conn) resend(sequenceNumbers []uint24) (err error) {
 }
 
 // sendDatagram sends a datagram over the connection that includes the packet
-// passed. It is assigned a new sequence number and added to the retransmission.
+// passed. It is assigned a new sequence number. Reliable packets are added to
+// the retransmission queue, whereas unreliable packets are never retransmitted
+// and returned to the packet pool straight after sending.
 func (conn *Conn) sendDatagram(pk *packet) error {
 	conn.buf.WriteByte(bitFlagDatagram | bitFlagNeedsBAndAS)
 	seq := conn.seq.Inc()
@@ -669,7 +713,8 @@ func (conn *Conn) sendDatagram(pk *packet) error {
 	pk.write(conn.buf)
 	defer conn.buf.Reset()
 
-	if pk.reliability.reliable() {
+	reliable := pk.reliability.reliable()
+	if reliable {
 		// We then re-add the pk to the recovery queue in case the new one gets
 		// lost too, in which case we need to resend it again.
 		conn.retransmission.add(seq, pk)
@@ -677,6 +722,12 @@ func (conn *Conn) sendDatagram(pk *packet) error {
 
 	if err := conn.writeTo(conn.buf.Bytes(), conn.raddr); err != nil {
 		return fmt.Errorf("send datagram: %w", err)
+	}
+	if !reliable {
+		// Unreliable packets do not enter the retransmission queue, so nothing
+		// keeps a reference to them after the datagram was written.
+		pk.content = pk.content[:0]
+		packetPool.Put(pk)
 	}
 	return nil
 }
