@@ -96,6 +96,9 @@ type Conn struct {
 	retransmission *resendMap
 
 	lastActivity atomic.Pointer[time.Time]
+
+	// stats holds the atomic counters exposed through Conn.Stats().
+	stats connStats
 }
 
 // newConn constructs a new connection specifically dedicated to the address
@@ -234,7 +237,15 @@ func (conn *Conn) checkResend(now time.Time) {
 // successful. If not, an error is returned and n is 0. Write may be called
 // simultaneously from multiple goroutines, but will write one by one.
 func (conn *Conn) Write(b []byte) (n int, err error) {
-	return conn.writeWithReliability(b, reliabilityReliableOrdered)
+	n, err = conn.writeWithReliability(b, reliabilityReliableOrdered)
+	if err == nil && n > 0 {
+		// Count the user message exactly once: Fragmentation and
+		// retransmission are handled below this boundary, so a message split
+		// into several fragments or re-sent later is never counted twice.
+		conn.stats.packetsSent.Add(1)
+		conn.stats.userBytesSent.Add(uint64(n))
+	}
+	return n, err
 }
 
 // writeWithReliability writes a buffer b over the RakNet connection using the
@@ -346,18 +357,25 @@ func (conn *Conn) Context() context.Context {
 // connection and closes the underlying UDP connection immediately.
 func (conn *Conn) closeImmediately() {
 	conn.once.Do(func() {
-		_, _ = conn.Write([]byte{message.IDDisconnectNotification})
+		// Send the disconnect notification directly so it is not counted as
+		// a user message in the statistics.
+		_, _ = conn.writeWithReliability([]byte{message.IDDisconnectNotification}, reliabilityReliableOrdered)
 		conn.handler.close(conn)
-		conn.cancelFunc()
 
 		conn.mu.Lock()
-		defer conn.mu.Unlock()
 		// Make sure to return all unacknowledged packets to the packet pool.
 		for _, record := range conn.retransmission.unacknowledged {
 			record.pk.content = record.pk.content[:0]
 			packetPool.Put(record.pk)
 		}
 		clear(conn.retransmission.unacknowledged)
+		conn.stats.unacknowledged.Store(0)
+		conn.mu.Unlock()
+
+		// Cancel the context last, once all state is finalised. Callers
+		// observing the cancellation can rely on the statistics reflecting
+		// the final connection state.
+		conn.cancelFunc()
 	})
 }
 
@@ -391,8 +409,10 @@ func (conn *Conn) Latency() time.Duration {
 
 // send encodes an encoding.BinaryMarshaler and writes it to the Conn.
 func (conn *Conn) send(pk encoding.BinaryMarshaler) error {
+	// Internal protocol messages bypass Write so that they are not counted as
+	// user messages in the statistics.
 	b, _ := pk.MarshalBinary()
-	_, err := conn.Write(b)
+	_, err := conn.writeWithReliability(b, reliabilityReliableOrdered)
 	return err
 }
 
@@ -412,11 +432,16 @@ var packetPool = sync.Pool{New: func() any { return &packet{reliability: reliabi
 func (conn *Conn) receive(b []byte) error {
 	t := time.Now()
 	conn.lastActivity.Store(&t)
+	// Count every packet read from the underlying UDP connection at the
+	// transport layer, including ACK/NACK packets and duplicates.
+	conn.stats.bytesReceived.Add(uint64(len(b)))
 
 	switch {
 	case b[0]&bitFlagACK != 0:
+		conn.stats.acksReceived.Add(1)
 		return conn.handleACK(b[1:])
 	case b[0]&bitFlagNACK != 0:
+		conn.stats.nacksReceived.Add(1)
 		return conn.handleNACK(b[1:])
 	case b[0]&bitFlagDatagram != 0:
 		return conn.receiveDatagram(b[1:])
@@ -436,9 +461,10 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 		// Datagram was already received, this might happen if a packet took a
 		// long time to arrive, and we already sent a NACK for it. This is
 		// expected to happen sometimes under normal circumstances, so no reason
-		// to return an error.
+		// to return an error. Duplicate datagrams are not counted.
 		return nil
 	}
+	conn.stats.datagramsReceived.Add(1)
 	conn.ackMu.Lock()
 	// Add this sequence number to the received datagrams, so that it is
 	// included in an ACK.
@@ -501,6 +527,7 @@ func (conn *Conn) receivePacket(packet *packet) error {
 			return err
 		}
 	}
+	conn.stats.orderedWindow.Store(uint32(conn.packetQueue.WindowSize()))
 	return nil
 }
 
@@ -522,6 +549,11 @@ func (conn *Conn) handlePacket(b []byte) error {
 		return fmt.Errorf("handle packet: %w", err)
 	}
 	if !handled {
+		// Count the reassembled user message once. Fragmented messages are
+		// only delivered after all fragments were joined, so fragments and
+		// duplicate deliveries never inflate the counters.
+		conn.stats.packetsReceived.Add(1)
+		conn.stats.userBytesReceived.Add(uint64(len(b)))
 		conn.packets.Send(b)
 	}
 	return nil
@@ -572,6 +604,9 @@ func (conn *Conn) receiveSplitPacket(p *packet) error {
 	p.content = slices.Concat(m...)
 
 	delete(conn.splits, p.splitID)
+	// All fragments were received and joined: The split message is now
+	// complete and handled as a single message.
+	conn.stats.splitsCompleted.Add(1)
 	return conn.receivePacket(p)
 }
 
@@ -604,6 +639,11 @@ func (conn *Conn) sendAcknowledgement(packets []uint24, bitflag byte, buf *bytes
 		if err := conn.writeTo(buf.Bytes(), conn.raddr); err != nil {
 			return fmt.Errorf("send acknowlegement: %w", err)
 		}
+		if bitflag == bitFlagACK {
+			conn.stats.acksSent.Add(1)
+		} else {
+			conn.stats.nacksSent.Add(1)
+		}
 		buf.Reset()
 	}
 	return nil
@@ -623,6 +663,7 @@ func (conn *Conn) handleACK(b []byte) error {
 	for _, sequenceNumber := range ack.packets {
 		// Take out all stored packets from the recovery queue.
 		if p, ok := conn.retransmission.acknowledge(sequenceNumber); ok {
+			conn.stats.unacknowledged.Add(-1)
 			// Clear the packet and return it to the pool so that it may be
 			// re-used.
 			p.content = p.content[:0]
@@ -653,9 +694,13 @@ func (conn *Conn) resend(sequenceNumbers []uint24) (err error) {
 		if !ok {
 			continue
 		}
+		conn.stats.unacknowledged.Add(-1)
 		if err = conn.sendDatagram(pk); err != nil {
 			return err
 		}
+		// The datagram is sent again, but its user payload is not counted
+		// again: The data layer counters are only updated through Write.
+		conn.stats.retransmissions.Add(1)
 	}
 	return nil
 }
@@ -673,11 +718,15 @@ func (conn *Conn) sendDatagram(pk *packet) error {
 		// We then re-add the pk to the recovery queue in case the new one gets
 		// lost too, in which case we need to resend it again.
 		conn.retransmission.add(seq, pk)
+		conn.stats.unacknowledged.Add(1)
 	}
 
 	if err := conn.writeTo(conn.buf.Bytes(), conn.raddr); err != nil {
 		return fmt.Errorf("send datagram: %w", err)
 	}
+	// Count the datagram at the transport layer. Retransmitted datagrams
+	// pass through here as well and are counted each time they are sent.
+	conn.stats.datagramsSent.Add(1)
 	return nil
 }
 
@@ -686,7 +735,13 @@ func (conn *Conn) sendDatagram(pk *packet) error {
 // is logged but not returned. This is done because at this stage, packets
 // being lost to an error can be recovered through resending.
 func (conn *Conn) writeTo(p []byte, raddr net.Addr) error {
-	if _, err := conn.conn.WriteTo(p, raddr); errors.Is(err, net.ErrClosed) {
+	n, err := conn.conn.WriteTo(p, raddr)
+	if n > 0 {
+		// Count every byte handed to the underlying UDP connection,
+		// including ACK/NACK packets and retransmitted datagrams.
+		conn.stats.bytesSent.Add(uint64(n))
+	}
+	if errors.Is(err, net.ErrClosed) {
 		return fmt.Errorf("write to: %w", err)
 	} else if err != nil {
 		conn.handler.log().Error("write to: "+err.Error(), "raddr", raddr.String())
