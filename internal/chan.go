@@ -3,74 +3,91 @@ package internal
 import (
 	"context"
 	"sync"
-	"sync/atomic"
 )
 
-// ElasticChan is a channel that grows if its capacity is reached. ElasticChan
-// is safe for concurrent use with multiple readers and 1 sender. Calling Send
-// from multiple goroutines simultaneously is unsafe.
+// ElasticChan is a channel that grows if its capacity is reached, up to the
+// maximum size passed to Chan. ElasticChan is safe for concurrent use with
+// any number of senders and receivers.
 type ElasticChan[T any] struct {
-	mu  sync.RWMutex
-	len atomic.Int64
-	ch  chan T
-	lim int64
+	mu sync.Mutex
+	// q holds the buffered values. Its backing array grows on demand up to
+	// lim, so values never have to be moved between channels while callers
+	// may be blocked on them.
+	q []T
+	// lim is the maximum number of values buffered at once. Send blocks once
+	// q holds lim values until a receiver makes room.
+	lim int
+
+	// nonEmpty is closed and replaced with a new channel whenever q goes
+	// from empty to non-empty. Closing it broadcasts the transition to every
+	// receiver waiting on the previous channel.
+	nonEmpty chan struct{}
+	// nonFull is closed and replaced whenever q drops from lim to lim-1.
+	// Closing it broadcasts the transition to every waiting sender.
+	nonFull chan struct{}
 }
 
-// Chan creates an ElasticChan of a size.
+// Chan creates an ElasticChan with the initial and maximum buffer sizes
+// passed.
 func Chan[T any](size, max int) *ElasticChan[T] {
-	c := new(ElasticChan[T])
-	c.lim = int64(max)
-	c.grow(size)
-	return c
+	return &ElasticChan[T]{
+		q:        make([]T, 0, size),
+		lim:      max,
+		nonEmpty: make(chan struct{}),
+		nonFull:  make(chan struct{}),
+	}
 }
 
-// Recv attempts to read a value from the channel. If ctx is canceled, Recv
-// will return ok = false.
+// Recv attempts to read a value from the channel. If ctx is canceled while no
+// value is available, Recv returns ok = false.
 func (c *ElasticChan[T]) Recv(ctx context.Context) (val T, ok bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	select {
-	case <-ctx.Done():
-		return val, false
-	case val = <-c.ch:
-		if c.len.Add(-1) < 0 {
-			panic("unreachable")
-		}
-		return val, true
-	}
-}
-
-// Send sends a value to the channel. Send never blocks, because if the maximum
-// capacity of the underlying channel is reached, a larger one is created.
-func (c *ElasticChan[T]) Send(val T) {
-	if ccap := int64(cap(c.ch)); c.len.Add(1) >= ccap && ccap < c.lim {
-		// This check happens outside a lock, meaning in the meantime, a call to
-		// Recv could cause the length to decrease, technically meaning growing
-		// is then unnecessary. That isn't a major issue though, as in most
-		// cases growing would still be necessary later.
-		c.growSend(val)
-		return
-	}
-	c.ch <- val
-}
-
-// growSend grows the channel to double the capacity, copying all values
-// currently in the channel, and sends the value to the new channel.
-func (c *ElasticChan[T]) growSend(val T) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.grow(max(cap(c.ch)*2, int(c.lim)))
-	c.ch <- val
+	for len(c.q) == 0 {
+		wake := c.nonEmpty
+		// Release the mutex while blocked: holding it would prevent a Send
+		// from making a value available and could deadlock with multiple
+		// receivers.
+		c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return val, false
+		case <-wake:
+		}
+		c.mu.Lock()
+	}
+	val = c.q[0]
+	// Clear the slot before advancing so values that are no longer queued
+	// (in particular pointer-containing payloads) can be garbage collected.
+	var zero T
+	c.q[0] = zero
+	c.q = c.q[1:]
+	if len(c.q)+1 == c.lim {
+		// The queue was full before this receive: wake senders waiting for
+		// room and replace the signal so future senders can block again.
+		close(c.nonFull)
+		c.nonFull = make(chan struct{})
+	}
+	c.mu.Unlock()
+	return val, true
 }
 
-// grow grows the ElasticChan to the size passed, copying all values currently
-// in the channel into a new channel with a bigger buffer.
-func (c *ElasticChan[T]) grow(size int) {
-	ch := make(chan T, size)
-	for len(c.ch) > 0 {
-		ch <- <-c.ch
+// Send sends a value to the channel. It never blocks unless the maximum
+// buffer size passed to Chan has been reached, in which case it blocks until a
+// receiver makes room.
+func (c *ElasticChan[T]) Send(val T) {
+	c.mu.Lock()
+	for len(c.q) >= c.lim {
+		room := c.nonFull
+		c.mu.Unlock()
+		<-room
+		c.mu.Lock()
 	}
-	c.ch = ch
+	if len(c.q) == 0 {
+		// Broadcast that a value is available and replace the signal so that
+		// receivers waking up after this transition block on a fresh one.
+		close(c.nonEmpty)
+		c.nonEmpty = make(chan struct{})
+	}
+	c.q = append(c.q, val)
+	c.mu.Unlock()
 }

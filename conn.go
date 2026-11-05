@@ -87,9 +87,10 @@ type Conn struct {
 	// packetQueue is an ordered queue containing packets indexed by their order
 	// index.
 	packetQueue *packetQueue
-	// packets is a channel containing content of packets that were fully
-	// processed. Calling Conn.Read() consumes a value from this channel.
-	packets *internal.ElasticChan[[]byte]
+	// packets is a channel containing packets that were fully processed.
+	// Calling Conn.Read(), Conn.ReadPacket() or
+	// Conn.ReadPacketWithMetadata() consumes a value from this channel.
+	packets *internal.ElasticChan[incomingPacket]
 
 	// retransmission is a queue filled with packets that were sent with a given
 	// datagram sequence number.
@@ -109,7 +110,7 @@ func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandle
 		handler:        h,
 		pk:             new(packet),
 		connected:      make(chan struct{}),
-		packets:        internal.Chan[[]byte](4, 4096),
+		packets:        internal.Chan[incomingPacket](4, 4096),
 		splits:         make(map[uint16][][]byte),
 		win:            newDatagramWindow(),
 		packetQueue:    newPacketQueue(),
@@ -302,6 +303,25 @@ func (conn *Conn) write(b []byte, rel reliability) (n int, err error) {
 	return n, nil
 }
 
+// incomingPacket is an application packet that was received in full,
+// together with the transport metadata of the encapsulated network packet
+// that delivered it. For split packets, the metadata is that of the final
+// fragment: the packet is only sent to the packets channel once every
+// fragment has arrived and content holds the reassembled payload.
+type incomingPacket struct {
+	content          []byte
+	reliability      reliability
+	datagramSequence uint24
+	messageIndex     uint24
+	orderIndex       uint24
+	split            bool
+	splitCount       uint32
+	splitIndex       uint32
+	// splitID identifies fragments belonging to the same split packet. It is
+	// used internally and is not exposed on ReceivedPacket.
+	splitID uint16
+}
+
 // Read reads from the connection into the byte slice passed. If successful,
 // the amount of bytes read n is returned, and the error returned will be nil.
 // Read blocks until a packet is received over the connection, or until the
@@ -310,10 +330,10 @@ func (conn *Conn) Read(b []byte) (n int, err error) {
 	pk, ok := conn.packets.Recv(conn.ctx)
 	if !ok {
 		return 0, conn.error(net.ErrClosed, "read")
-	} else if len(b) < len(pk) {
+	} else if len(b) < len(pk.content) {
 		return 0, conn.error(ErrBufferTooSmall, "read")
 	}
-	return copy(b, pk), err
+	return copy(b, pk.content), err
 }
 
 // ReadPacket attempts to read the next packet as a byte slice. ReadPacket
@@ -324,7 +344,77 @@ func (conn *Conn) ReadPacket() (b []byte, err error) {
 	if !ok {
 		return nil, conn.error(net.ErrClosed, "read")
 	}
-	return pk, err
+	return pk.content, err
+}
+
+// ReceivedPacket is a complete application-layer packet read from a Conn with
+// ReadPacketWithMetadata, together with transport metadata describing how the
+// packet was delivered. A split packet is never returned fragment by
+// fragment: all fragments are reassembled before ReceivedPacket is returned,
+// and the metadata describes the network packet carrying the final fragment
+// that completed it.
+//
+// The byte slice in Payload is owned by the caller. It never aliases a buffer
+// that is reused by the Conn or returned to an internal buffer pool, so the
+// caller may modify Payload without affecting packets read afterwards.
+type ReceivedPacket struct {
+	// Payload is the complete application-layer content of the packet.
+	Payload []byte
+	// Reliability is the reliability with which the packet was transported.
+	Reliability Reliability
+	// DatagramSequence is the sequence number of the datagram that carried
+	// the packet. Every packet encapsulated in the same datagram shares the
+	// same DatagramSequence. For a split packet, it is the sequence number
+	// of the datagram that carried its final fragment.
+	DatagramSequence uint32
+	// MessageIndex is the reliable message index of the packet. It is 0 for
+	// reliabilities that do not carry a message index (Unreliable and
+	// UnreliableSequenced). For a split packet it is the message index of
+	// its final fragment.
+	MessageIndex uint32
+	// OrderIndex is the order index used to deliver reliable ordered and
+	// sequenced packets. It is 0 for the Reliable and Unreliable
+	// reliabilities, which do not carry an order index.
+	OrderIndex uint32
+	// Split reports whether the packet was transported as multiple
+	// fragments. When Split is false, SplitCount and SplitIndex are 0.
+	Split bool
+	// SplitCount is the total number of fragments the packet was split
+	// into. It is 0 when Split is false.
+	SplitCount uint32
+	// SplitIndex is the zero-based index of the final fragment that
+	// completed the packet, so SplitIndex is SplitCount-1 for every split
+	// packet. It is 0 when Split is false.
+	SplitIndex uint32
+}
+
+// ReadPacketWithMetadata behaves exactly like ReadPacket: it blocks until the
+// next complete application packet is available, or until the session is
+// closed, in which case an error is returned. In addition to the packet
+// content, it returns transport metadata such as the reliability, datagram
+// sequence number, message and order indices and split packet information.
+// ReadPacketWithMetadata may be called concurrently from multiple goroutines,
+// just like ReadPacket: each caller receives the next packet in turn.
+func (conn *Conn) ReadPacketWithMetadata() (ReceivedPacket, error) {
+	pk, ok := conn.packets.Recv(conn.ctx)
+	if !ok {
+		return ReceivedPacket{}, conn.error(net.ErrClosed, "read")
+	}
+	// Copy the content so the slice handed out can never alias a buffer the
+	// Conn reuses or returns to a pool later. Caller modifications therefore
+	// cannot affect subsequent reads.
+	payload := make([]byte, len(pk.content))
+	copy(payload, pk.content)
+	return ReceivedPacket{
+		Payload:          payload,
+		Reliability:      pk.reliability,
+		DatagramSequence: uint32(pk.datagramSequence),
+		MessageIndex:     uint32(pk.messageIndex),
+		OrderIndex:       uint32(pk.orderIndex),
+		Split:            pk.split,
+		SplitCount:       pk.splitCount,
+		SplitIndex:       pk.splitIndex,
+	}, nil
 }
 
 // Close closes the connection. All blocking Read or Write actions are
@@ -458,11 +548,13 @@ func (conn *Conn) receiveDatagram(b []byte) error {
 	if conn.win.size() > maxWindowSize && conn.handler.limitsEnabled() {
 		return fmt.Errorf("receive datagram: queue window size is too big (%v-%v)", conn.win.lowest, conn.win.highest)
 	}
-	return conn.handleDatagram(b[3:])
+	return conn.handleDatagram(b[3:], seq)
 }
 
 // handleDatagram handles the contents of a datagram encoded in a bytes.Buffer.
-func (conn *Conn) handleDatagram(b []byte) error {
+// All packets contained in the datagram share the datagram sequence number
+// seq passed.
+func (conn *Conn) handleDatagram(b []byte, seq uint24) error {
 	for len(b) > 0 {
 		n, err := conn.pk.read(b)
 		if err != nil {
@@ -470,11 +562,22 @@ func (conn *Conn) handleDatagram(b []byte) error {
 		}
 		b = b[n:]
 
+		in := incomingPacket{
+			content:          conn.pk.content,
+			reliability:      conn.pk.reliability,
+			datagramSequence: seq,
+			messageIndex:     conn.pk.messageIndex,
+			orderIndex:       conn.pk.orderIndex,
+			split:            conn.pk.split,
+			splitCount:       conn.pk.splitCount,
+			splitIndex:       conn.pk.splitIndex,
+			splitID:          conn.pk.splitID,
+		}
 		handle := conn.receivePacket
 		if conn.pk.split {
 			handle = conn.receiveSplitPacket
 		}
-		if err := handle(conn.pk); err != nil {
+		if err := handle(in); err != nil {
 			return fmt.Errorf("handle datagram: receive packet: %w", err)
 		}
 	}
@@ -484,20 +587,20 @@ func (conn *Conn) handleDatagram(b []byte) error {
 // receivePacket handles the receiving of a packet. It puts the packet in the
 // queue and takes out all packets that were obtainable after that, and handles
 // them.
-func (conn *Conn) receivePacket(packet *packet) error {
-	if packet.reliability != reliabilityReliableOrdered {
+func (conn *Conn) receivePacket(in incomingPacket) error {
+	if in.reliability != reliabilityReliableOrdered {
 		// If it isn't a reliable ordered packet, handle it immediately.
-		return conn.handlePacket(packet.content)
+		return conn.handlePacket(in)
 	}
-	if !conn.packetQueue.put(packet.orderIndex, packet.content) {
+	if !conn.packetQueue.put(in.orderIndex, in) {
 		// An ordered packet arrived twice.
 		return nil
 	}
 	if conn.packetQueue.WindowSize() > maxWindowSize && conn.handler.limitsEnabled() {
 		return fmt.Errorf("packet queue window size is too big (%v-%v)", conn.packetQueue.lowest, conn.packetQueue.highest)
 	}
-	for _, content := range conn.packetQueue.fetch() {
-		if err := conn.handlePacket(content); err != nil {
+	for _, packet := range conn.packetQueue.fetch() {
+		if err := conn.handlePacket(packet); err != nil {
 			return err
 		}
 	}
@@ -506,23 +609,23 @@ func (conn *Conn) receivePacket(packet *packet) error {
 
 var errZeroPacket = errors.New("handle packet: zero packet length")
 
-// handlePacket handles a packet serialised in byte slice b. If not successful,
-// an error is returned. If the packet was not handled by RakNet, it is sent to
-// the packet channel.
-func (conn *Conn) handlePacket(b []byte) error {
-	if len(b) == 0 {
+// handlePacket handles a fully received packet. If not successful, an error
+// is returned. If the packet was not handled by RakNet, it is sent to the
+// packet channel together with its metadata.
+func (conn *Conn) handlePacket(in incomingPacket) error {
+	if len(in.content) == 0 {
 		return errZeroPacket
 	}
 	if conn.closing.Load() != 0 {
 		// Don't continue handling packets if the connection is being closed.
 		return nil
 	}
-	handled, err := conn.handler.handle(conn, b)
+	handled, err := conn.handler.handle(conn, in.content)
 	if err != nil {
 		return fmt.Errorf("handle packet: %w", err)
 	}
 	if !handled {
-		conn.packets.Send(b)
+		conn.packets.Send(in)
 	}
 	return nil
 }
@@ -541,38 +644,43 @@ func resolve(addr net.Addr) netip.AddrPort {
 
 // receiveSplitPacket handles a passed split packet. If it is the last split
 // packet of its sequence, it will continue handling the full packet as it
-// otherwise would. An error is returned if the packet was not valid.
-func (conn *Conn) receiveSplitPacket(p *packet) error {
+// otherwise would. An error is returned if the packet was not valid. The
+// metadata of the final fragment is kept, so the packet returned to readers
+// describes the network packet that completed the split packet.
+func (conn *Conn) receiveSplitPacket(in incomingPacket) error {
 	const maxSplitCount = 512
 	const maxConcurrentSplits = 16
 
-	if p.splitCount > maxSplitCount && conn.handler.limitsEnabled() {
-		return fmt.Errorf("split packet: split count %v exceeds the maximum %v", p.splitCount, maxSplitCount)
+	if in.splitCount > maxSplitCount && conn.handler.limitsEnabled() {
+		return fmt.Errorf("split packet: split count %v exceeds the maximum %v", in.splitCount, maxSplitCount)
 	}
 	if len(conn.splits) > maxConcurrentSplits && conn.handler.limitsEnabled() {
 		return fmt.Errorf("split packet: maximum concurrent splits %v reached", maxConcurrentSplits)
 	}
-	m, ok := conn.splits[p.splitID]
+	m, ok := conn.splits[in.splitID]
 	if !ok {
-		m = make([][]byte, p.splitCount)
-		conn.splits[p.splitID] = m
+		m = make([][]byte, in.splitCount)
+		conn.splits[in.splitID] = m
 	}
-	if p.splitIndex > uint32(len(m)-1) {
+	if in.splitIndex > uint32(len(m)-1) {
 		// The split index was either negative or was bigger than the slice
 		// size, meaning the packet is invalid.
-		return fmt.Errorf("split packet: split index %v is out of range (0 - %v)", p.splitIndex, len(m)-1)
+		return fmt.Errorf("split packet: split index %v is out of range (0 - %v)", in.splitIndex, len(m)-1)
 	}
-	m[p.splitIndex] = p.content
+	m[in.splitIndex] = in.content
 
 	if slices.ContainsFunc(m, func(i []byte) bool { return len(i) == 0 }) {
 		// We haven't yet received all split fragments, so we cannot add the
 		// packets together yet.
 		return nil
 	}
-	p.content = slices.Concat(m...)
+	// in still holds the metadata (including datagram sequence number,
+	// message index, split count and split index) of the final fragment
+	// that completed this split packet; only the content is reassembled.
+	in.content = slices.Concat(m...)
 
-	delete(conn.splits, p.splitID)
-	return conn.receivePacket(p)
+	delete(conn.splits, in.splitID)
+	return conn.receivePacket(in)
 }
 
 // sendACK sends an acknowledgement packet containing the packet sequence

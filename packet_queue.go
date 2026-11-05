@@ -4,17 +4,17 @@ package raknet
 type packetQueue struct {
 	lowest  uint24
 	highest uint24
-	queue   map[uint24][]byte
+	queue   map[uint24]incomingPacket
 }
 
 // newPacketQueue returns a new initialised ordered queue.
 func newPacketQueue() *packetQueue {
-	return &packetQueue{queue: make(map[uint24][]byte)}
+	return &packetQueue{queue: make(map[uint24]incomingPacket)}
 }
 
 // put puts a value at the index passed. If the index was already occupied
 // once, false is returned.
-func (queue *packetQueue) put(index uint24, packet []byte) bool {
+func (queue *packetQueue) put(index uint24, packet incomingPacket) bool {
 	if index < queue.lowest {
 		return false
 	}
@@ -31,7 +31,7 @@ func (queue *packetQueue) put(index uint24, packet []byte) bool {
 // fetch attempts to take out as many values from the ordered queue as
 // possible. Upon encountering an index that has no value yet, the function
 // returns all values that it did find and takes them out.
-func (queue *packetQueue) fetch() (packets [][]byte) {
+func (queue *packetQueue) fetch() (packets []incomingPacket) {
 	index := queue.lowest
 	for index < queue.highest {
 		packet, ok := queue.queue[index]

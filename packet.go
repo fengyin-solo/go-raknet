@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -24,8 +25,6 @@ const (
 	// reliabilityUnreliable means that the packet sent could arrive out of
 	// order, be duplicated, or just not arrive at all. It is usually used for
 	// high frequency packets of which the order does not matter.
-	//lint:ignore U1000 While this constant is unused, it is here for the sake
-	// of having all reliabilities documented.
 	reliabilityUnreliable reliability = iota
 	// reliabilityUnreliableSequenced means that the packet sent could be
 	// duplicated or not arrive at all, but ensures that it is always handled in
@@ -47,7 +46,58 @@ const (
 	splitFlag = 0x10
 )
 
+// Reliability is the reliability with which a packet was transported over
+// the connection. The numeric value of every Reliability is the on-wire
+// RakNet reliability identifier: these values are part of the protocol and
+// are guaranteed to remain stable.
+type Reliability = reliability
+
+// Reliabilities a packet may be transported with. The numeric values are the
+// fixed on-wire RakNet reliability identifiers and are guaranteed not to
+// change; String returns the matching stable name.
+const (
+	// Unreliable means that the packet could arrive out of order, be
+	// duplicated, or not arrive at all. Unreliable packets carry no message
+	// index and no order index.
+	Unreliable Reliability = reliabilityUnreliable
+	// UnreliableSequenced means that the packet could be duplicated or not
+	// arrive at all, but is always handled in the right order.
+	UnreliableSequenced Reliability = reliabilityUnreliableSequenced
+	// Reliable means that the packet arrives and is not duplicated, but may
+	// arrive out of order. Reliable packets carry a message index, but no
+	// order index.
+	Reliable Reliability = reliabilityReliable
+	// ReliableOrdered means that every packet arrives, arrives in the right
+	// order and is not duplicated. Packets carry both a message index and an
+	// order index.
+	ReliableOrdered Reliability = reliabilityReliableOrdered
+	// ReliableSequenced means that the packet arrives, is not duplicated and
+	// is handled in the right order.
+	ReliableSequenced Reliability = reliabilityReliableSequenced
+)
+
 type reliability byte
+
+// String returns the stable name of the reliability, such as
+// "ReliableOrdered". If the reliability is not one of the known reliability
+// constants, a name of the form "Reliability(n)" with the numeric value is
+// returned.
+func (r reliability) String() string {
+	switch r {
+	case reliabilityUnreliable:
+		return "Unreliable"
+	case reliabilityUnreliableSequenced:
+		return "UnreliableSequenced"
+	case reliabilityReliable:
+		return "Reliable"
+	case reliabilityReliableOrdered:
+		return "ReliableOrdered"
+	case reliabilityReliableSequenced:
+		return "ReliableSequenced"
+	default:
+		return fmt.Sprintf("Reliability(%d)", byte(r))
+	}
+}
 
 // reliable checks packets with this reliability require a message index,
 // therefore meaning that packets are never received twice.
@@ -124,6 +174,13 @@ func (pk *packet) read(b []byte) (int, error) {
 	header := b[0]
 	pk.split = (header & splitFlag) != 0
 	pk.reliability = reliability((header & 224) >> 5)
+
+	// Reset all fields that are only present on the wire for some
+	// reliabilities or for split packets: packet is re-used to read
+	// consecutive packets, so values left by a previous packet would
+	// otherwise leak into this one.
+	pk.messageIndex, pk.sequenceIndex, pk.orderIndex = 0, 0, 0
+	pk.splitCount, pk.splitIndex, pk.splitID = 0, 0, 0
 
 	n := binary.BigEndian.Uint16(b[1:]) >> 3
 	if n == 0 {
